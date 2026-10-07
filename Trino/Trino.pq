@@ -54,7 +54,7 @@ shared TrinoType = type function (
     optional TargetResultSize as (type number meta [
         DataSource.Path = false,
         Documentation.FieldCaption = "Target result size",
-        Documentation.FieldDescription = "The maximum size of data returned in a response in MB per request. Default: 1, Max: 128",        
+        Documentation.FieldDescription = "The maximum size of data returned in a response in MB per request. Default: 32, Max: 128",        
         Documentation.SampleValues = {1}
     ]),
     optional SQLQuery as (type text meta [
@@ -80,6 +80,9 @@ UserHeaders = (User as nullable text) as record =>
 DefaultRetries = 5;
 DefaultTimeout = 100;
 DefaultDelayAPICallRetry = #duration(0,0,0,1/2);
+// MB per page of results. Trino's own default is 1 MB, which means thousands of sequential requests for a
+// large table; the maximum is 128.
+DefaultTargetResultSize = 32;
 Http = if (Extension.CurrentCredential()[AuthenticationKind]?) = "Implicit" then "http://" else "https://";
 
 TrinoImpl = (Host as text, Port as number, optional Catalog as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number, optional SQLQuery as text) as table =>
@@ -266,11 +269,7 @@ PostStatementQueryTables = (url as text, Catalog as text, schema as text, table 
 
 GetPage = (url as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table =>
     let        
-        Query = 
-            if TargetResultSize <> null then
-                [targetResultSize = Text.From(TargetResultSize) & "MB"]
-            else
-                [],
+        Query = [targetResultSize = Text.From(if TargetResultSize <> null then TargetResultSize else DefaultTargetResultSize) & "MB"],
         response = Value.WaitFor(
                 (iteration) =>
                     let
@@ -326,17 +325,9 @@ GetPage = (url as text, User as text, Retries as number, Timeout as number, opti
                     ColumnTableMappingTranspose = Table.Transpose(Table.SelectColumns(ColumnTableMappingFiltered, {"name", "typeMapping"})),
                     ColumnTableMappingTransposeList = Table.ToColumns(ColumnTableMappingTranspose),
 
-                    // Prepare corresponding data
-                    DataTableConvert = Record.ToTable(body),
-                    DataTableFilteredRows = Table.SelectRows(DataTableConvert, each ([Name] = "data")),
-                    DataTableConvertExpandedValue = Table.ExpandListColumn(DataTableFilteredRows, "Value"),
-                    DataTableFilteredRowsAddedCustom = Table.AddColumn(DataTableConvertExpandedValue, "Custom", each Table.Transpose(Table.FromList([Value], Splitter.SplitByNothing(), null, null, ExtraValues.Error))),
-                    Data = Table.SelectColumns(DataTableFilteredRowsAddedCustom, {"Custom"}),
-
-                    // Bring together columns and data
-                    ColumnTableColumnsList = List.Generate(()=> [Counter=1], each [Counter] <= Table.RowCount(ColumnTable), each [Counter=[Counter]+1], each "Column" & Number.ToText([Counter])),
-                    DataTableFilteredRowsExpandedCustom = Table.ExpandTableColumn(Data, "Custom", ColumnTableColumnsList),
-                    DataTableReName = Table.RenameColumns(DataTableFilteredRowsExpandedCustom, List.Zip({Table.ColumnNames(DataTableFilteredRowsExpandedCustom), ColumnTable[name]})),
+                    // Prepare corresponding data: all rows of the page become one table in one step
+                    // (this used to build one small table per row and expand them, which dominated the load time)
+                    DataTableReName = Table.FromRows(body[data], ColumnTable[name]),
 
                     // Apply column type transformations
                     DataTableReType = Table.TransformColumnTypes(DataTableReName, ColumnTableMappingTransposeList)
