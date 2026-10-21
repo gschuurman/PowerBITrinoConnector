@@ -77,6 +77,9 @@ DefaultUser = "TrinoPBI";
 // impersonation rights, so only the other authentication kinds send it.
 UserHeaders = (User as nullable text) as record =>
     if (Extension.CurrentCredential()[AuthenticationKind]?) = "OAuth" then [] else [#"X-Trino-User" = User];
+// Every Trino request bypasses Power Query's response cache (IsRetry = true). Without it, the same statement
+// (the navigator always sends "show catalogs") was answered from the cache with an old response, e.g. a
+// PERMISSION_DENIED from an earlier incident, without the request ever reaching Trino.
 DefaultRetries = 5;
 DefaultTimeout = 100;
 DefaultDelayAPICallRetry = #duration(0,0,0,1/2);
@@ -101,13 +104,12 @@ TrinoImpl = (Host as text, Port as number, optional Catalog as text, optional Us
                     response = Value.WaitFor(
                         (iteration) =>
                             let
-                                isRetry = if iteration > 0 then true else false,
                                 response = Web.Contents(Url,
                                     [
                                         Content = Text.ToBinary(SQLQuery)
                                         ,Headers = UserHeaders(User)
                                         ,Timeout = #duration(0, 0, 0, Timeout)
-                                        ,IsRetry = isRetry
+                                        ,IsRetry = true
                                     ]
                                 ),
                                 buffered = Binary.Buffer(response),
@@ -131,13 +133,12 @@ PostStatementCatalogs = (url as text, optional Catalog as text, optional User as
         response = Value.WaitFor(
                 (iteration) =>
                     let
-                        isRetry = if iteration > 0 then true else false,
                         response = Web.Contents(url,
                             [
                                  Content = Text.ToBinary("show catalogs")
                                 ,Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry
+                                ,IsRetry = true
                             ]
                         ),                        
                         buffered = Binary.Buffer(response),
@@ -157,13 +158,12 @@ PostStatementSchemas = (url as text, Catalog as text, User as text, Retries as n
         response = Value.WaitFor(
                 (iteration) =>
                     let
-                        isRetry = if iteration > 0 then true else false,
                         response = Web.Contents(url,
                             [
                                  Content = Text.ToBinary("select schema_name from """ & Catalog & """.information_schema.schemata")
                                 ,Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry
+                                ,IsRetry = true
                             ]
                         ),
                         buffered = Binary.Buffer(response),
@@ -183,13 +183,12 @@ PostStatementTables = (url as text, Catalog as text, Schema as text, User as tex
         response = Value.WaitFor(
                 (iteration) =>
                     let
-                        isRetry = if iteration > 0 then true else false,
                         response = Web.Contents(url, 
                             [
                                  Content = Text.ToBinary("select table_name, table_schema from """ & Catalog & """.information_schema.tables where table_schema = '" & Schema & "'")
                                 ,Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry                                
+                                ,IsRetry = true                                
                             ]
                         ), 
                         buffered = Binary.Buffer(response),
@@ -210,13 +209,12 @@ PostStatementQueryColumnNames = (url as text, Catalog as text, schema as text, t
        response = Value.WaitFor(
                 (iteration) =>
                     let
-                        isRetry = if iteration > 0 then true else false,
                         response = Web.Contents(url, 
                             [
                                  Content = Text.ToBinary("select column_name from """ & Catalog & """.information_schema.columns where table_schema = '" & schema & "' and table_name = '" & table & "' order by ordinal_position")
                                 ,Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry
+                                ,IsRetry = true
                             ]
                         ), 
                         buffered = Binary.Buffer(response),
@@ -246,13 +244,12 @@ PostStatementQueryTables = (url as text, Catalog as text, schema as text, table 
         response = Value.WaitFor(
                 (iteration) =>
                     let
-                        isRetry = if iteration > 0 then true else false,
                         response = Web.Contents(url, 
                             [
                                  Content = Text.ToBinary("select " & ColumnNameStringSelectString & " from """ & Catalog & """.""" & schema & """.""" & table & """")
                                 ,Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry
+                                ,IsRetry = true
                             ]
                         ), 
                         buffered = Binary.Buffer(response),
@@ -273,12 +270,11 @@ GetPage = (url as text, User as text, Retries as number, Timeout as number, opti
         response = Value.WaitFor(
                 (iteration) =>
                     let
-                        isRetry = if iteration > 0 then true else false,
                         response = Web.Contents(url, 
                             [
                                  Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry   
+                                ,IsRetry = true   
                                 ,Query = Query                          
                             ]
                         ), 
