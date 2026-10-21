@@ -568,7 +568,9 @@ TokenLifetime = (token as text) as number =>
 FinishLoginTrino = (context, callbackUri, state) =>
     let
         token = PollTrinoToken(context, 0),
-        lifetime = try TokenLifetime(token) otherwise 300
+        // A Keycloak JWT carries exp. With refresh tokens on, Trino hands out its own encrypted token
+        // (JWE, five parts, unreadable here) that is valid for an hour: assume a bit less.
+        lifetime = try TokenLifetime(token) otherwise (if List.Count(Text.Split(token, ".")) = 5 then 3300 else 300)
     in
         [access_token = token, token_type = "bearer", expires_in = lifetime];
 
