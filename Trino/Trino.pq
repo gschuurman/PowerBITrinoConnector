@@ -119,7 +119,7 @@ TrinoImpl = (Host as text, Port as number, optional Catalog as text, optional Us
                         Retries
                     ),
                     body = Json.Document(response),
-                    Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri], User, Retries, Timeout, TargetResultSize)
+                    Source = if (Record.HasFields(body, {"error"})) then TrinoError(body) else GetAllPagesByNextLink(body[nextUri], User, Retries, Timeout, TargetResultSize)
                 in
                     Source
     in
@@ -148,7 +148,7 @@ PostStatementCatalogs = (url as text, optional Catalog as text, optional User as
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)        
+        Source = if (Record.HasFields(body, {"error"})) then TrinoError(body) else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)        
      in
         if Catalog = null then Source else #table({"Catalog"}, {{Catalog}});
 
@@ -174,7 +174,7 @@ PostStatementSchemas = (url as text, Catalog as text, User as text, Retries as n
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then TrinoError(body) else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
      in
         Source;
 
@@ -200,7 +200,7 @@ PostStatementTables = (url as text, Catalog as text, Schema as text, User as tex
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then TrinoError(body) else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
 
      in
         Source;
@@ -227,7 +227,7 @@ PostStatementQueryColumnNames = (url as text, Catalog as text, schema as text, t
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then TrinoError(body) else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
      in
         Source;
 
@@ -263,7 +263,7 @@ PostStatementQueryTables = (url as text, Catalog as text, schema as text, table 
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then TrinoError(body) else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
      in
         Source;
 
@@ -334,14 +334,28 @@ GetPage = (url as text, User as text, Retries as number, Timeout as number, opti
                 in
                     DataTableReType
             else if (Record.HasFields(body, {"error"})) then 
-                let
-                    Output = error Error.Record("Trino Error: " & body[error][errorName], body[error][message], body[error][failureInfo][stack])
-                in
-                    Output
+                TrinoError(body)
             else
                 #table({},{})                     
     in
         DataTable meta [NextLink = nextLink];
+
+// A failed query as a Power Query error: Trino's error name (CATALOG_NOT_FOUND, PERMISSION_DENIED, ...) in the
+// reason, its message plus what to do in the message. A navigation step saved in a report keeps pointing at a
+// catalog, schema or table after it is removed, and then fails before the navigator can show the current list.
+TrinoError = (body as record) =>
+    let
+        e = body[error],
+        name = Record.FieldOrDefault(e, "errorName", "UNKNOWN"),
+        hint =
+            if List.Contains({"CATALOG_NOT_FOUND", "SCHEMA_NOT_FOUND", "TABLE_NOT_FOUND"}, name) then
+                " It no longer exists or was renamed. If this report navigates to it, remove that navigation step in Power Query (or connect again) to choose from the current list."
+            else if name = "PERMISSION_DENIED" then
+                " Your account has no access to this. Request access in the data catalog of your platform."
+            else ""
+    in
+        error Error.Record("Trino error: " & name, Record.FieldOrDefault(e, "message", "") & hint,
+            Record.FieldOrDefault(Record.FieldOrDefault(e, "failureInfo", []), "stack", null));
 
 ///////////////////////
 ///// NAVIGATION //////
