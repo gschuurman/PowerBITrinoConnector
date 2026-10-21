@@ -213,7 +213,7 @@ PostStatementQueryColumnNames = (url as text, Catalog as text, schema as text, t
                     let
                         response = Web.Contents(url, 
                             [
-                                 Content = Text.ToBinary("select column_name from """ & Catalog & """.information_schema.columns where table_schema = '" & schema & "' and table_name = '" & table & "' order by ordinal_position")
+                                 Content = Text.ToBinary("select column_name, data_type from """ & Catalog & """.information_schema.columns where table_schema = '" & schema & "' and table_name = '" & table & "' order by ordinal_position")
                                 ,Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
                                 ,IsRetry = true
@@ -231,10 +231,64 @@ PostStatementQueryColumnNames = (url as text, Catalog as text, schema as text, t
      in
         Source;
 
-PostStatementQueryTables = (url as text, Catalog as text, schema as text, table as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  =>    
+PostStatementQueryTables = (url as text, Catalog as text, schema as text, table as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table =>
+    TrinoTableView([Url = url, Catalog = Catalog, Schema = schema, Table = table, User = User, Retries = Retries,
+        Timeout = Timeout, TargetResultSize = TargetResultSize, Limit = null,
+        Columns = PostStatementQueryColumnNames(url, Catalog, schema, table, User, Retries, Timeout, TargetResultSize)]);
+
+// A Trino table as a view: when Power Query asks for only the first N rows (the navigator preview asks for
+// 1000), OnTake turns that into LIMIT N in Trino instead of fetching the whole table. The column list (names
+// and Trino types) is fetched once and carried along, and the type comes from it without reading data,
+// through the same conversion as every result page. Everything else (load, refresh) reads the full table.
+TrinoTableView = (state as record) as table =>
+    let
+        Empty = TypedEmptyTable(state[Columns]),
+        Run = (limit as nullable number) =>
+            let
+                rows = RunTableQuery(state[Url], state[Catalog], state[Schema], state[Table], state[User], state[Retries],
+                    state[Timeout], state[Columns], state[TargetResultSize], limit)
+            in
+                // No rows: Trino sends no columns either, so return the typed empty table.
+                if Table.ColumnCount(rows) = 0 then Empty else rows
+    in
+        Table.View(null, [
+            GetType = () => Value.Type(Empty),
+            GetRows = () => Run(state[Limit]),
+            OnTake = (count as number) =>
+                @TrinoTableView(state & [Limit = if state[Limit] = null then count else List.Min({state[Limit], count})])
+        ]);
+
+// Trino's type name of a column (as in a result page and in information_schema.columns.data_type) to the M type
+// it is converted to. Types Power Query cannot convert (array, map, json, row) stay untyped.
+TrinoTypeToM = (t as text) as type =>
+    if Text.Contains(t, "char") then type text //VARCHAR, CHAR
+    else if Text.Contains(t, "int") then type number //TINYINT, SMALLINT, INTEGER, BIGINT
+    else if Text.Contains(t, "decimal") then type number //DECIMAL
+    else if Text.Contains(t, "boolean") then type logical //BOOLEAN
+    else if Value.Equals(t, "date") then type date //DATE
+    else if Value.Equals(t, "time") then type time //TIME, TIME(P)
+    else if Value.Equals(t, "timestamp") then type datetime //TIMESTAMP, TIMESTAMP(P)
+    else if Text.Contains(t, "with time zone") then type text //TIMESTAMP(P) WITH TIME ZONE, TIMESTAMP WITH TIME ZONE, TIME WITH TIME ZONE
+    else if Text.Contains(t, "real") then type number //REAL
+    else if Text.Contains(t, "double") then type number //DOUBLE
+    else if Text.Contains(t, "varbinary") then type binary //VARBINARY
+    else type text; //INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, IPADDRESS, UUID
+
+TrinoTypeConvertible = (t as text) as logical =>
+    not (Text.Contains(t, "array") or Text.Contains(t, "map") or Text.Contains(t, "json") or Text.Contains(t, "row"));
+
+// The table type of a result with these columns (table with column_name and data_type), without rows.
+TypedEmptyTable = (columns as table) as table =>
+    let
+        typed = Table.SelectRows(columns, each TrinoTypeConvertible([data_type]))
+    in
+        Table.TransformColumnTypes(#table(columns[column_name], {}),
+            List.Transform(Table.ToRecords(typed), each {[column_name], TrinoTypeToM([data_type])}));
+
+RunTableQuery = (url as text, Catalog as text, schema as text, table as text, User as text, Retries as number, Timeout as number, Columns as table, optional TargetResultSize as number, optional Limit as number) as table  =>    
     let   
         //get and prepare column names
-        ColumnNamesTable = PostStatementQueryColumnNames(url,Catalog,schema,table,User,Retries,Timeout,TargetResultSize),
+        ColumnNamesTable = Table.SelectColumns(Columns, {"column_name"}),
         ColumnNameAddedCustom = Table.AddColumn(ColumnNamesTable, "group", each "group"),
         ColumnNameGroupedRows = Table.Group(ColumnNameAddedCustom, {"group"}, {{"column_name_group", each _, type table [column_name=nullable text, group=text]}}),
         DataAddedCustom = Table.AddColumn(ColumnNameGroupedRows, "column_name", each Table.Column([column_name_group], "column_name")),
@@ -248,7 +302,8 @@ PostStatementQueryTables = (url as text, Catalog as text, schema as text, table 
                     let
                         response = Web.Contents(url, 
                             [
-                                 Content = Text.ToBinary("select " & ColumnNameStringSelectString & " from """ & Catalog & """.""" & schema & """.""" & table & """")
+                                 Content = Text.ToBinary("select " & ColumnNameStringSelectString & " from """ & Catalog & """.""" & schema & """.""" & table & """"
+                                    & (if Limit = null then "" else " limit " & Number.ToText(Limit)))
                                 ,Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
                                 ,IsRetry = true
@@ -300,27 +355,10 @@ GetPage = (url as text, User as text, Retries as number, Timeout as number, opti
                     ColumnTableExpandedValue = Table.ExpandListColumn(ColumnTableFilteredRows, "Value"),
                     ColumnTableFilteredRowsExpandedValue = Table.ExpandRecordColumn(ColumnTableExpandedValue, "Value", {"name", "type"}, {"name", "type"}),
                     ColumnTable = Table.RemoveColumns(ColumnTableFilteredRowsExpandedValue,{"Name"}),
-                    ColumnTableMapping = Table.AddColumn(ColumnTable, "typeMapping", each 
-                        if Text.Contains([type], "char") then type text //VARCHAR, CHAR
-                        else if Text.Contains([type], "int") then type number //TINYINT, SMALLINT, INTEGER, BIGINT
-                        else if Text.Contains([type], "decimal") then type number //DECIMAL
-                        else if Text.Contains([type], "boolean") then type logical //BOOLEAN
-                        else if Value.Equals([type], "date") then type date //DATE
-                        else if Value.Equals([type], "time") then type time //TIME, TIME(P)
-                        else if Value.Equals([type], "timestamp") then type datetime //TIMESTAMP, TIMESTAMP(P) 
-                        else if Text.Contains([type], "with time zone") then type text //TIMESTAMP(P) WITH TIME ZONE, TIMESTAMP WITH TIME ZONE, TIME WITH TIME ZONE                  
-                        else if Text.Contains([type], "real") then type number //REAL
-                        else if Text.Contains([type], "double") then type number //DOUBLE  
-                        else if Text.Contains([type], "varbinary") then type binary //VARBINARY
-                        else type text), //INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, IPADDRESS, UUID
+                    ColumnTableMapping = Table.AddColumn(ColumnTable, "typeMapping", each TrinoTypeToM([type])),
 
-                    // Prepare the list for TransformColumnTypes and filter out columns with type containing "MAP", "JSON", "ARRAY", or "ROW" otherwise error occurs
-                    ColumnTableMappingFiltered = Table.SelectRows(ColumnTableMapping, each not (
-                        Text.Contains([type], "array") or
-                        Text.Contains([type], "map") or
-                        Text.Contains([type], "json") or
-                        Text.Contains([type], "row")
-                    )),
+                    // Columns Power Query cannot convert (array, map, json, row) stay untyped, otherwise an error occurs
+                    ColumnTableMappingFiltered = Table.SelectRows(ColumnTableMapping, each TrinoTypeConvertible([type])),
                     ColumnTableMappingTranspose = Table.Transpose(Table.SelectColumns(ColumnTableMappingFiltered, {"name", "typeMapping"})),
                     ColumnTableMappingTransposeList = Table.ToColumns(ColumnTableMappingTranspose),
 
