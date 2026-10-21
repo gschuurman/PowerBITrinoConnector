@@ -77,9 +77,11 @@ DefaultUser = "TrinoPBI";
 // impersonation rights, so only the other authentication kinds send it.
 UserHeaders = (User as nullable text) as record =>
     if (Extension.CurrentCredential()[AuthenticationKind]?) = "OAuth" then [] else [#"X-Trino-User" = User];
-// Every Trino request bypasses Power Query's response cache (IsRetry = true). Without it, the same statement
-// (the navigator always sends "show catalogs") was answered from the cache with an old response, e.g. a
-// PERMISSION_DENIED from an earlier incident, without the request ever reaching Trino.
+// Statements (POST /v1/statement) bypass Power Query's response cache (IsRetry = true): the same text (the
+// navigator always sends "show catalogs") was otherwise answered from the cache with an old response, e.g. a
+// PERMISSION_DENIED from an earlier incident, without reaching Trino. Result pages (nextUri) keep the cache:
+// every nextUri is unique per query, Power Query evaluates the paging more than once, and Trino answers
+// 410 Gone to a page token it has already handed out.
 DefaultRetries = 5;
 DefaultTimeout = 100;
 DefaultDelayAPICallRetry = #duration(0,0,0,1/2);
@@ -270,11 +272,12 @@ GetPage = (url as text, User as text, Retries as number, Timeout as number, opti
         response = Value.WaitFor(
                 (iteration) =>
                     let
+                        isRetry = if iteration > 0 then true else false,
                         response = Web.Contents(url, 
                             [
                                  Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = true   
+                                ,IsRetry = isRetry   
                                 ,Query = Query                          
                             ]
                         ), 
