@@ -522,7 +522,9 @@ Trino = [
             FinishLogin = (context, callbackUri, state) =>
                 if auth_mode = "trino" then FinishLoginTrino(context, callbackUri, state)
                 else FinishLogin(context, callbackUri, state),
-            Refresh = Refresh
+            Refresh = (resourceUrl, refresh_token) =>
+                if auth_mode = "trino" then RefreshTrino(resourceUrl, refresh_token)
+                else Refresh(resourceUrl, refresh_token)
         ],
         UsernamePassword = [
             UsernameLabel = Extension.LoadString("UsernameLabelText"),
@@ -603,14 +605,29 @@ TokenLifetime = (token as text) as number =>
     in
         List.Max({30, exp - now - 30});
 
-FinishLoginTrino = (context, callbackUri, state) =>
+FinishLoginTrino = (context, callbackUri, state) => TrinoCredential(PollTrinoToken(context, 0));
+
+// A Keycloak JWT carries exp. With Trino's refresh tokens on, Trino hands out its own encrypted token (JWE, five
+// parts, unreadable here) that lasts as long as Keycloak's access token, about 5 minutes (measured on internal):
+// assume 4. The token is also the refresh token: RefreshTrino trades it for a new one.
+TrinoCredential = (token as text) as record =>
+    [access_token = token, refresh_token = token, token_type = "bearer",
+        expires_in = try TokenLifetime(token) otherwise (if List.Count(Text.Split(token, ".")) = 5 then 240 else 300)];
+
+// Trino renews its own token without a browser: a request with the expired token gets 401 with only an
+// x_token_server, which hands out the new token straight away (Trino refreshes against Keycloak itself, for as
+// long as the Keycloak session lasts). A token that still works is kept.
+RefreshTrino = (resourceUrl as text, token as text) as record =>
     let
-        token = PollTrinoToken(context, 0),
-        // A Keycloak JWT carries exp. With refresh tokens on, Trino hands out its own encrypted token
-        // (JWE, five parts, unreadable here) that is valid for an hour: assume a bit less.
-        lifetime = try TokenLifetime(token) otherwise (if List.Count(Text.Split(token, ".")) = 5 then 3300 else 300)
+        probe = Web.Contents(TrinoBaseUrl(resourceUrl) & "/v1/statement", [
+            Content = Text.ToBinary("SELECT 1"),
+            Headers = [Authorization = "Bearer " & token],
+            ManualStatusHandling = {401},
+            IsRetry = true]),
+        status = Value.Metadata(probe)[Response.Status]
     in
-        [access_token = token, token_type = "bearer", expires_in = lifetime];
+        if status <> 401 then TrinoCredential(token)
+        else TrinoCredential(PollTrinoToken(ChallengeParameter(Value.Metadata(probe)[Headers][#"WWW-Authenticate"], "x_token_server"), 0));
 
 // OAuth helper functions: StartLogin, FinishLogin, Refresh (Authorization Code + PKCE)
 
