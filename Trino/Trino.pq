@@ -54,7 +54,7 @@ shared TrinoType = type function (
     optional TargetResultSize as (type number meta [
         DataSource.Path = false,
         Documentation.FieldCaption = "Target result size",
-        Documentation.FieldDescription = "The maximum size of data returned in a response in MB per request. Default: 1, Max: 128",        
+        Documentation.FieldDescription = "The maximum size of data returned in a response in MB per request. Default: 32, Max: 128",        
         Documentation.SampleValues = {1}
     ]),
     optional SQLQuery as (type text meta [
@@ -77,9 +77,17 @@ DefaultUser = "TrinoPBI";
 // impersonation rights, so only the other authentication kinds send it.
 UserHeaders = (User as nullable text) as record =>
     if (Extension.CurrentCredential()[AuthenticationKind]?) = "OAuth" then [] else [#"X-Trino-User" = User];
+// Statements (POST /v1/statement) bypass Power Query's response cache (IsRetry = true): the same text (the
+// navigator always sends "show catalogs") was otherwise answered from the cache with an old response, e.g. a
+// PERMISSION_DENIED from an earlier incident, without reaching Trino. Result pages (nextUri) keep the cache:
+// every nextUri is unique per query, Power Query evaluates the paging more than once, and Trino answers
+// 410 Gone to a page token it has already handed out.
 DefaultRetries = 5;
 DefaultTimeout = 100;
 DefaultDelayAPICallRetry = #duration(0,0,0,1/2);
+// MB per page of results. Trino's own default is 1 MB, which means thousands of sequential requests for a
+// large table; the maximum is 128.
+DefaultTargetResultSize = 32;
 Http = if (Extension.CurrentCredential()[AuthenticationKind]?) = "Implicit" then "http://" else "https://";
 
 TrinoImpl = (Host as text, Port as number, optional Catalog as text, optional User as text, optional Retries as number, optional Timeout as number, optional TargetResultSize as number, optional SQLQuery as text) as table =>
@@ -98,13 +106,12 @@ TrinoImpl = (Host as text, Port as number, optional Catalog as text, optional Us
                     response = Value.WaitFor(
                         (iteration) =>
                             let
-                                isRetry = if iteration > 0 then true else false,
                                 response = Web.Contents(Url,
                                     [
                                         Content = Text.ToBinary(SQLQuery)
                                         ,Headers = UserHeaders(User)
                                         ,Timeout = #duration(0, 0, 0, Timeout)
-                                        ,IsRetry = isRetry
+                                        ,IsRetry = true
                                     ]
                                 ),
                                 buffered = Binary.Buffer(response),
@@ -116,7 +123,7 @@ TrinoImpl = (Host as text, Port as number, optional Catalog as text, optional Us
                         Retries
                     ),
                     body = Json.Document(response),
-                    Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri], User, Retries, Timeout, TargetResultSize)
+                    Source = if (Record.HasFields(body, {"error"})) then TrinoError(body) else GetAllPagesByNextLink(body[nextUri], User, Retries, Timeout, TargetResultSize)
                 in
                     Source
     in
@@ -128,13 +135,12 @@ PostStatementCatalogs = (url as text, optional Catalog as text, optional User as
         response = Value.WaitFor(
                 (iteration) =>
                     let
-                        isRetry = if iteration > 0 then true else false,
                         response = Web.Contents(url,
                             [
                                  Content = Text.ToBinary("show catalogs")
                                 ,Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry
+                                ,IsRetry = true
                             ]
                         ),                        
                         buffered = Binary.Buffer(response),
@@ -145,7 +151,7 @@ PostStatementCatalogs = (url as text, optional Catalog as text, optional User as
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)        
+        Source = if (Record.HasFields(body, {"error"})) then TrinoError(body) else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)        
      in
         if Catalog = null then Source else #table({"Catalog"}, {{Catalog}});
 
@@ -154,13 +160,12 @@ PostStatementSchemas = (url as text, Catalog as text, User as text, Retries as n
         response = Value.WaitFor(
                 (iteration) =>
                     let
-                        isRetry = if iteration > 0 then true else false,
                         response = Web.Contents(url,
                             [
                                  Content = Text.ToBinary("select schema_name from """ & Catalog & """.information_schema.schemata")
                                 ,Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry
+                                ,IsRetry = true
                             ]
                         ),
                         buffered = Binary.Buffer(response),
@@ -171,7 +176,7 @@ PostStatementSchemas = (url as text, Catalog as text, User as text, Retries as n
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then TrinoError(body) else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
      in
         Source;
 
@@ -180,13 +185,12 @@ PostStatementTables = (url as text, Catalog as text, Schema as text, User as tex
         response = Value.WaitFor(
                 (iteration) =>
                     let
-                        isRetry = if iteration > 0 then true else false,
                         response = Web.Contents(url, 
                             [
                                  Content = Text.ToBinary("select table_name, table_schema from """ & Catalog & """.information_schema.tables where table_schema = '" & Schema & "'")
                                 ,Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry                                
+                                ,IsRetry = true                                
                             ]
                         ), 
                         buffered = Binary.Buffer(response),
@@ -197,7 +201,7 @@ PostStatementTables = (url as text, Catalog as text, Schema as text, User as tex
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then TrinoError(body) else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
 
      in
         Source;
@@ -207,13 +211,12 @@ PostStatementQueryColumnNames = (url as text, Catalog as text, schema as text, t
        response = Value.WaitFor(
                 (iteration) =>
                     let
-                        isRetry = if iteration > 0 then true else false,
                         response = Web.Contents(url, 
                             [
-                                 Content = Text.ToBinary("select column_name from """ & Catalog & """.information_schema.columns where table_schema = '" & schema & "' and table_name = '" & table & "' order by ordinal_position")
+                                 Content = Text.ToBinary("select column_name, data_type from """ & Catalog & """.information_schema.columns where table_schema = '" & schema & "' and table_name = '" & table & "' order by ordinal_position")
                                 ,Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry
+                                ,IsRetry = true
                             ]
                         ), 
                         buffered = Binary.Buffer(response),
@@ -224,14 +227,68 @@ PostStatementQueryColumnNames = (url as text, Catalog as text, schema as text, t
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then TrinoError(body) else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
      in
         Source;
 
-PostStatementQueryTables = (url as text, Catalog as text, schema as text, table as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table  =>    
+PostStatementQueryTables = (url as text, Catalog as text, schema as text, table as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table =>
+    TrinoTableView([Url = url, Catalog = Catalog, Schema = schema, Table = table, User = User, Retries = Retries,
+        Timeout = Timeout, TargetResultSize = TargetResultSize, Limit = null,
+        Columns = PostStatementQueryColumnNames(url, Catalog, schema, table, User, Retries, Timeout, TargetResultSize)]);
+
+// A Trino table as a view: when Power Query asks for only the first N rows (the navigator preview asks for
+// 1000), OnTake turns that into LIMIT N in Trino instead of fetching the whole table. The column list (names
+// and Trino types) is fetched once and carried along, and the type comes from it without reading data,
+// through the same conversion as every result page. Everything else (load, refresh) reads the full table.
+TrinoTableView = (state as record) as table =>
+    let
+        Empty = TypedEmptyTable(state[Columns]),
+        Run = (limit as nullable number) =>
+            let
+                rows = RunTableQuery(state[Url], state[Catalog], state[Schema], state[Table], state[User], state[Retries],
+                    state[Timeout], state[Columns], state[TargetResultSize], limit)
+            in
+                // No rows: Trino sends no columns either, so return the typed empty table.
+                if Table.ColumnCount(rows) = 0 then Empty else rows
+    in
+        Table.View(null, [
+            GetType = () => Value.Type(Empty),
+            GetRows = () => Run(state[Limit]),
+            OnTake = (count as number) =>
+                @TrinoTableView(state & [Limit = if state[Limit] = null then count else List.Min({state[Limit], count})])
+        ]);
+
+// Trino's type name of a column (as in a result page and in information_schema.columns.data_type) to the M type
+// it is converted to. Types Power Query cannot convert (array, map, json, row) stay untyped.
+TrinoTypeToM = (t as text) as type =>
+    if Text.Contains(t, "char") then type text //VARCHAR, CHAR
+    else if Text.Contains(t, "int") then type number //TINYINT, SMALLINT, INTEGER, BIGINT
+    else if Text.Contains(t, "decimal") then type number //DECIMAL
+    else if Text.Contains(t, "boolean") then type logical //BOOLEAN
+    else if Value.Equals(t, "date") then type date //DATE
+    else if Value.Equals(t, "time") then type time //TIME, TIME(P)
+    else if Value.Equals(t, "timestamp") then type datetime //TIMESTAMP, TIMESTAMP(P)
+    else if Text.Contains(t, "with time zone") then type text //TIMESTAMP(P) WITH TIME ZONE, TIMESTAMP WITH TIME ZONE, TIME WITH TIME ZONE
+    else if Text.Contains(t, "real") then type number //REAL
+    else if Text.Contains(t, "double") then type number //DOUBLE
+    else if Text.Contains(t, "varbinary") then type binary //VARBINARY
+    else type text; //INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, IPADDRESS, UUID
+
+TrinoTypeConvertible = (t as text) as logical =>
+    not (Text.Contains(t, "array") or Text.Contains(t, "map") or Text.Contains(t, "json") or Text.Contains(t, "row"));
+
+// The table type of a result with these columns (table with column_name and data_type), without rows.
+TypedEmptyTable = (columns as table) as table =>
+    let
+        typed = Table.SelectRows(columns, each TrinoTypeConvertible([data_type]))
+    in
+        Table.TransformColumnTypes(#table(columns[column_name], {}),
+            List.Transform(Table.ToRecords(typed), each {[column_name], TrinoTypeToM([data_type])}));
+
+RunTableQuery = (url as text, Catalog as text, schema as text, table as text, User as text, Retries as number, Timeout as number, Columns as table, optional TargetResultSize as number, optional Limit as number) as table  =>    
     let   
         //get and prepare column names
-        ColumnNamesTable = PostStatementQueryColumnNames(url,Catalog,schema,table,User,Retries,Timeout,TargetResultSize),
+        ColumnNamesTable = Table.SelectColumns(Columns, {"column_name"}),
         ColumnNameAddedCustom = Table.AddColumn(ColumnNamesTable, "group", each "group"),
         ColumnNameGroupedRows = Table.Group(ColumnNameAddedCustom, {"group"}, {{"column_name_group", each _, type table [column_name=nullable text, group=text]}}),
         DataAddedCustom = Table.AddColumn(ColumnNameGroupedRows, "column_name", each Table.Column([column_name_group], "column_name")),
@@ -243,13 +300,13 @@ PostStatementQueryTables = (url as text, Catalog as text, schema as text, table 
         response = Value.WaitFor(
                 (iteration) =>
                     let
-                        isRetry = if iteration > 0 then true else false,
                         response = Web.Contents(url, 
                             [
-                                 Content = Text.ToBinary("select " & ColumnNameStringSelectString & " from """ & Catalog & """.""" & schema & """.""" & table & """")
+                                 Content = Text.ToBinary("select " & ColumnNameStringSelectString & " from """ & Catalog & """.""" & schema & """.""" & table & """"
+                                    & (if Limit = null then "" else " limit " & Number.ToText(Limit)))
                                 ,Headers = UserHeaders(User)
                                 ,Timeout = #duration(0, 0, 0, Timeout)
-                                ,IsRetry = isRetry
+                                ,IsRetry = true
                             ]
                         ), 
                         buffered = Binary.Buffer(response),
@@ -260,17 +317,13 @@ PostStatementQueryTables = (url as text, Catalog as text, schema as text, table 
                 (iteration) => DefaultDelayAPICallRetry,
                 Retries),
         body = Json.Document(response),
-        Source = if (Record.HasFields(body, {"error"})) then error body[error][message] else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
+        Source = if (Record.HasFields(body, {"error"})) then TrinoError(body) else GetAllPagesByNextLink(body[nextUri],User,Retries,Timeout,TargetResultSize)
      in
         Source;
 
 GetPage = (url as text, User as text, Retries as number, Timeout as number, optional TargetResultSize as number) as table =>
     let        
-        Query = 
-            if TargetResultSize <> null then
-                [targetResultSize = Text.From(TargetResultSize) & "MB"]
-            else
-                [],
+        Query = [targetResultSize = Text.From(if TargetResultSize <> null then TargetResultSize else DefaultTargetResultSize) & "MB"],
         response = Value.WaitFor(
                 (iteration) =>
                     let
@@ -302,55 +355,44 @@ GetPage = (url as text, User as text, Retries as number, Timeout as number, opti
                     ColumnTableExpandedValue = Table.ExpandListColumn(ColumnTableFilteredRows, "Value"),
                     ColumnTableFilteredRowsExpandedValue = Table.ExpandRecordColumn(ColumnTableExpandedValue, "Value", {"name", "type"}, {"name", "type"}),
                     ColumnTable = Table.RemoveColumns(ColumnTableFilteredRowsExpandedValue,{"Name"}),
-                    ColumnTableMapping = Table.AddColumn(ColumnTable, "typeMapping", each 
-                        if Text.Contains([type], "char") then type text //VARCHAR, CHAR
-                        else if Text.Contains([type], "int") then type number //TINYINT, SMALLINT, INTEGER, BIGINT
-                        else if Text.Contains([type], "decimal") then type number //DECIMAL
-                        else if Text.Contains([type], "boolean") then type logical //BOOLEAN
-                        else if Value.Equals([type], "date") then type date //DATE
-                        else if Value.Equals([type], "time") then type time //TIME, TIME(P)
-                        else if Value.Equals([type], "timestamp") then type datetime //TIMESTAMP, TIMESTAMP(P) 
-                        else if Text.Contains([type], "with time zone") then type text //TIMESTAMP(P) WITH TIME ZONE, TIMESTAMP WITH TIME ZONE, TIME WITH TIME ZONE                  
-                        else if Text.Contains([type], "real") then type number //REAL
-                        else if Text.Contains([type], "double") then type number //DOUBLE  
-                        else if Text.Contains([type], "varbinary") then type binary //VARBINARY
-                        else type text), //INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, IPADDRESS, UUID
+                    ColumnTableMapping = Table.AddColumn(ColumnTable, "typeMapping", each TrinoTypeToM([type])),
 
-                    // Prepare the list for TransformColumnTypes and filter out columns with type containing "MAP", "JSON", "ARRAY", or "ROW" otherwise error occurs
-                    ColumnTableMappingFiltered = Table.SelectRows(ColumnTableMapping, each not (
-                        Text.Contains([type], "array") or
-                        Text.Contains([type], "map") or
-                        Text.Contains([type], "json") or
-                        Text.Contains([type], "row")
-                    )),
+                    // Columns Power Query cannot convert (array, map, json, row) stay untyped, otherwise an error occurs
+                    ColumnTableMappingFiltered = Table.SelectRows(ColumnTableMapping, each TrinoTypeConvertible([type])),
                     ColumnTableMappingTranspose = Table.Transpose(Table.SelectColumns(ColumnTableMappingFiltered, {"name", "typeMapping"})),
                     ColumnTableMappingTransposeList = Table.ToColumns(ColumnTableMappingTranspose),
 
-                    // Prepare corresponding data
-                    DataTableConvert = Record.ToTable(body),
-                    DataTableFilteredRows = Table.SelectRows(DataTableConvert, each ([Name] = "data")),
-                    DataTableConvertExpandedValue = Table.ExpandListColumn(DataTableFilteredRows, "Value"),
-                    DataTableFilteredRowsAddedCustom = Table.AddColumn(DataTableConvertExpandedValue, "Custom", each Table.Transpose(Table.FromList([Value], Splitter.SplitByNothing(), null, null, ExtraValues.Error))),
-                    Data = Table.SelectColumns(DataTableFilteredRowsAddedCustom, {"Custom"}),
-
-                    // Bring together columns and data
-                    ColumnTableColumnsList = List.Generate(()=> [Counter=1], each [Counter] <= Table.RowCount(ColumnTable), each [Counter=[Counter]+1], each "Column" & Number.ToText([Counter])),
-                    DataTableFilteredRowsExpandedCustom = Table.ExpandTableColumn(Data, "Custom", ColumnTableColumnsList),
-                    DataTableReName = Table.RenameColumns(DataTableFilteredRowsExpandedCustom, List.Zip({Table.ColumnNames(DataTableFilteredRowsExpandedCustom), ColumnTable[name]})),
+                    // Prepare corresponding data: all rows of the page become one table in one step
+                    // (this used to build one small table per row and expand them, which dominated the load time)
+                    DataTableReName = Table.FromRows(body[data], ColumnTable[name]),
 
                     // Apply column type transformations
                     DataTableReType = Table.TransformColumnTypes(DataTableReName, ColumnTableMappingTransposeList)
                 in
                     DataTableReType
             else if (Record.HasFields(body, {"error"})) then 
-                let
-                    Output = error Error.Record("Trino Error: " & body[error][errorName], body[error][message], body[error][failureInfo][stack])
-                in
-                    Output
+                TrinoError(body)
             else
                 #table({},{})                     
     in
         DataTable meta [NextLink = nextLink];
+
+// A failed query as a Power Query error: Trino's error name (CATALOG_NOT_FOUND, PERMISSION_DENIED, ...) in the
+// reason, its message plus what to do in the message. A navigation step saved in a report keeps pointing at a
+// catalog, schema or table after it is removed, and then fails before the navigator can show the current list.
+TrinoError = (body as record) =>
+    let
+        e = body[error],
+        name = Record.FieldOrDefault(e, "errorName", "UNKNOWN"),
+        hint =
+            if List.Contains({"CATALOG_NOT_FOUND", "SCHEMA_NOT_FOUND", "TABLE_NOT_FOUND"}, name) then
+                " It no longer exists or was renamed. If this report navigates to it, remove that navigation step in Power Query (or connect again) to choose from the current list."
+            else if name = "PERMISSION_DENIED" then
+                " Your account has no access to this. Request access in the data catalog of your platform."
+            else ""
+    in
+        error Error.Record("Trino error: " & name, Record.FieldOrDefault(e, "message", "") & hint,
+            Record.FieldOrDefault(Record.FieldOrDefault(e, "failureInfo", []), "stack", null));
 
 ///////////////////////
 ///// NAVIGATION //////
@@ -480,7 +522,9 @@ Trino = [
             FinishLogin = (context, callbackUri, state) =>
                 if auth_mode = "trino" then FinishLoginTrino(context, callbackUri, state)
                 else FinishLogin(context, callbackUri, state),
-            Refresh = Refresh
+            Refresh = (resourceUrl, refresh_token) =>
+                if auth_mode = "trino" then RefreshTrino(resourceUrl, refresh_token)
+                else Refresh(resourceUrl, refresh_token)
         ],
         UsernamePassword = [
             UsernameLabel = Extension.LoadString("UsernameLabelText"),
@@ -508,8 +552,8 @@ Trino = [
 //   4. Every request then carries Authorization: Bearer <token>.
 // Power Query only opens a browser for an OAuth StartLogin and only continues when the window reaches
 // CallbackUri. Here CallbackUri is Trino's own /oauth2/callback; FinishLogin then polls for the token.
-// UNVERIFIED in Power BI: whether the window closing on that URL still lets Trino finish the
-// callback, and whether Web.Contents works inside StartLogin/FinishLogin before a token exists.
+// Verified in Power BI Desktop (2026-10-22): Trino still finishes the callback when the window closes on
+// that URL, and Web.Contents works inside StartLogin/FinishLogin before a token exists.
 
 TrinoBaseUrl = (resourceUrl as text) as text =>
     let
@@ -561,12 +605,29 @@ TokenLifetime = (token as text) as number =>
     in
         List.Max({30, exp - now - 30});
 
-FinishLoginTrino = (context, callbackUri, state) =>
+FinishLoginTrino = (context, callbackUri, state) => TrinoCredential(PollTrinoToken(context, 0));
+
+// A Keycloak JWT carries exp. With Trino's refresh tokens on, Trino hands out its own encrypted token (JWE, five
+// parts, unreadable here) that lasts as long as Keycloak's access token, about 5 minutes (measured on internal):
+// assume 4. The token is also the refresh token: RefreshTrino trades it for a new one.
+TrinoCredential = (token as text) as record =>
+    [access_token = token, refresh_token = token, token_type = "bearer",
+        expires_in = try TokenLifetime(token) otherwise (if List.Count(Text.Split(token, ".")) = 5 then 240 else 300)];
+
+// Trino renews its own token without a browser: a request with the expired token gets 401 with only an
+// x_token_server, which hands out the new token straight away (Trino refreshes against Keycloak itself, for as
+// long as the Keycloak session lasts). A token that still works is kept.
+RefreshTrino = (resourceUrl as text, token as text) as record =>
     let
-        token = PollTrinoToken(context, 0),
-        lifetime = try TokenLifetime(token) otherwise 300
+        probe = Web.Contents(TrinoBaseUrl(resourceUrl) & "/v1/statement", [
+            Content = Text.ToBinary("SELECT 1"),
+            Headers = [Authorization = "Bearer " & token],
+            ManualStatusHandling = {401},
+            IsRetry = true]),
+        status = Value.Metadata(probe)[Response.Status]
     in
-        [access_token = token, token_type = "bearer", expires_in = lifetime];
+        if status <> 401 then TrinoCredential(token)
+        else TrinoCredential(PollTrinoToken(ChallengeParameter(Value.Metadata(probe)[Headers][#"WWW-Authenticate"], "x_token_server"), 0));
 
 // OAuth helper functions: StartLogin, FinishLogin, Refresh (Authorization Code + PKCE)
 
@@ -810,7 +871,10 @@ Value.WaitFor = (producer as function, interval as function, optional count as n
         list = List.Generate(
             () => {0, null},
             (state) => state{0} <> null and (count = null or state{0} < count),
-            (state) => if state{1} <> null then {null, state{1}} else {1 + state{0}, Function.InvokeAfter(() => producer(state{0}), interval(state{0}))},
+            // The first attempt runs at once; only retries wait for `interval`. (Every request used to wait
+            // 0.5 s first: the POST and each result page, about a second per query.)
+            (state) => if state{1} <> null then {null, state{1}} else {1 + state{0},
+                if state{0} = 0 then producer(0) else Function.InvokeAfter(() => producer(state{0}), interval(state{0}))},
             (state) => state{1})
     in
         List.Last(list);
