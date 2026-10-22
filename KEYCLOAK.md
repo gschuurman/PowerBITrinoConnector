@@ -7,7 +7,7 @@ Two sign-in modes, chosen at build time (`AUTH_MODE`):
   `WWW-Authenticate: Bearer x_redirect_server="...", x_token_server="..."`; the user signs in at the redirect
   URL (Trino sends them to the right Keycloak realm, so realms can be dynamic); the connector polls the token
   server and then sends `Authorization: Bearer <token>`. No separate Keycloak client and no realm setting.
-  **Unverified in Power BI**: see the comment above `StartLoginTrino` in `Trino/Trino.pq`.
+  Tested end to end in Power BI Desktop (2026-10-22).
 - **`keycloak` (fallback):** one fixed realm, Authorization Code with PKCE, public client, no secret.
   Everything below about the Keycloak client and `KEYCLOAK_*` applies to this mode only.
 
@@ -42,4 +42,4 @@ Options -> Security set "Data Extensions" to allow uncertified extensions, then 
 
 - `Trino.pq`: PKCE and `Refresh` replace the Cognito client-secret flow; `X-Trino-User` is not sent with
   OAuth (Trino takes the identity from the token, and the header would trigger an impersonation check).
-- `build/build.py` builds the `.mez` without the Power Query SDK. Not verified against a real Power BI yet.
+- `build/build.py` builds the `.mez` without the Power Query SDK. Its `trino`-mode build works in Power BI Desktop.

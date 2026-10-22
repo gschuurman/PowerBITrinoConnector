@@ -552,8 +552,8 @@ Trino = [
 //   4. Every request then carries Authorization: Bearer <token>.
 // Power Query only opens a browser for an OAuth StartLogin and only continues when the window reaches
 // CallbackUri. Here CallbackUri is Trino's own /oauth2/callback; FinishLogin then polls for the token.
-// UNVERIFIED in Power BI: whether the window closing on that URL still lets Trino finish the
-// callback, and whether Web.Contents works inside StartLogin/FinishLogin before a token exists.
+// Verified in Power BI Desktop (2026-10-22): Trino still finishes the callback when the window closes on
+// that URL, and Web.Contents works inside StartLogin/FinishLogin before a token exists.
 
 TrinoBaseUrl = (resourceUrl as text) as text =>
     let
